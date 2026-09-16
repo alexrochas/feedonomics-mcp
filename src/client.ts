@@ -69,7 +69,7 @@ export async function sessionGet(path: string): Promise<unknown> {
 // ever reaches the tool response — Feedonomics' export/import list endpoints
 // return live SFTP credentials (username/password, sometimes private keys)
 // inline, which must never land in a chat transcript.
-const SECRET_KEYS = /^(password|private_key|private_key_pass|secret|client_secret|api_key|access_token|refresh_token|token)$/i;
+const SECRET_KEYS = /(password|private_key|secret|api_key|apikey|auth_token|access_token|refresh_token|^token$|consumer_id|consumer_key|consumer_secret|client_id|mws_auth_token|feedonomics_auth_token)/i;
 
 function redactSecrets<T>(value: T): T {
   if (Array.isArray(value)) return value.map(redactSecrets) as T;
