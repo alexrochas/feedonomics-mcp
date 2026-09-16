@@ -1,52 +1,43 @@
-// Shared HTTP client for the Feedonomics Platform/Content REST APIs.
-// Read-only by construction: `get()` only issues GET requests, and the one
-// POST endpoint we wrap (`downloadExportData`) hardcodes `push: false` so it
-// can never trigger a channel push or mutate account config.
+// Shared HTTP client for the Feedonomics internal web-app API (see auth.ts).
+// Read-only by construction: `sessionGet()` only issues GET requests, and
+// the one POST endpoint wrapped (`downloadExportData`) hardcodes
+// `push: false` so it can never trigger a channel push or mutate config.
 const BASE_URL = process.env.FEEDONOMICS_BASE_URL ?? "https://meta.feedonomics.com/api.php";
-
-function authHeaders(): Record<string, string> {
-  const token = process.env.FEEDONOMICS_TOKEN;
-  const apiKey = process.env.FEEDONOMICS_API_KEY;
-  if (!token || !apiKey) {
-    throw new Error(
-      "Missing FEEDONOMICS_TOKEN and/or FEEDONOMICS_API_KEY environment variables."
-    );
-  }
-  return {
-    Authorization: `Bearer ${token}`,
-    "x-api-key": apiKey,
-  };
-}
-
-export async function get(path: string): Promise<unknown> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: "GET",
-    headers: authHeaders(),
-  });
-  return handle(res);
-}
 
 // Wraps the documented `run_parallel_export` endpoint with fixed,
 // non-mutating parameters. `push` is always false, so this only returns
-// data — it never sends anything to a downstream channel.
+// data — it never sends anything to a downstream channel. Uses session auth
+// (see sessionGet below) since real Bearer/x-api-key access isn't set up yet.
 export async function downloadExportData(
   dbId: number,
   exportId: number,
   opts: { delimiter?: "tab" | "comma" | "pipe" | "semicolon"; rawData?: boolean } = {}
 ): Promise<unknown> {
-  const res = await fetch(`${BASE_URL}/dbs/${dbId}/exports/${exportId}/run_parallel_export`, {
-    method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({
-      delimiter: opts.delimiter ?? "comma",
-      do_notify: false,
-      fe_download: true,
-      ignore_export_selector: false,
-      no_transformers: opts.rawData ?? false,
-      push: "false",
-    }),
+  const { getSessionAuth, silentRelogin } = await import("./auth.js");
+  const body = JSON.stringify({
+    delimiter: opts.delimiter ?? "comma",
+    do_notify: false,
+    fe_download: true,
+    ignore_export_selector: false,
+    no_transformers: opts.rawData ?? false,
+    push: "false",
   });
-  return handle(res);
+  const path = `/dbs/${dbId}/exports/${exportId}/run_parallel_export`;
+  const post = (cookie: string, xsrf: string) =>
+    fetch(`${BASE_URL}${path}`, {
+      method: "POST",
+      headers: { Cookie: cookie, "X-XSRF-TOKEN": xsrf, "Content-Type": "application/json", Accept: "application/json" },
+      body,
+    });
+
+  const { cookie, xsrf } = await getSessionAuth();
+  const res = await post(cookie, xsrf);
+  if (res.status === 401) {
+    await silentRelogin();
+    const fresh = await getSessionAuth();
+    return redactSecrets(await handle(await post(fresh.cookie, fresh.xsrf)));
+  }
+  return redactSecrets(await handle(res));
 }
 
 // ponytail: stopgap auth for the internal meta.feedonomics.com web-app API
@@ -69,9 +60,27 @@ export async function sessionGet(path: string): Promise<unknown> {
       method: "GET",
       headers: { Cookie: freshCookie, "X-XSRF-TOKEN": freshXsrf, Accept: "application/json" },
     });
-    return handle(retry);
+    return redactSecrets(await handle(retry));
   }
-  return handle(res);
+  return redactSecrets(await handle(res));
+}
+
+// Any object key matching this list gets its value replaced before the data
+// ever reaches the tool response — Feedonomics' export/import list endpoints
+// return live SFTP credentials (username/password, sometimes private keys)
+// inline, which must never land in a chat transcript.
+const SECRET_KEYS = /^(password|private_key|private_key_pass|secret|client_secret|api_key|access_token|refresh_token|token)$/i;
+
+function redactSecrets<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(redactSecrets) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) =>
+        SECRET_KEYS.test(k) && v ? [k, "[REDACTED]"] : [k, redactSecrets(v)]
+      )
+    ) as T;
+  }
+  return value;
 }
 
 async function handle(res: Response): Promise<unknown> {
