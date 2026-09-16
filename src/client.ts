@@ -49,6 +49,31 @@ export async function downloadExportData(
   return handle(res);
 }
 
+// ponytail: stopgap auth for the internal meta.feedonomics.com web-app API
+// (session cookie + XSRF token), used until real Platform API access
+// (Bearer + x-api-key via the 2FA /login flow) is granted. Undocumented,
+// fragile — breaks whenever the browser session expires. GET-only, same as
+// the documented client above. Session is obtained/refreshed via auth.ts
+// (see feedonomics_login_start / feedonomics_login_verify tools).
+export async function sessionGet(path: string): Promise<unknown> {
+  const { getSessionAuth, silentRelogin } = await import("./auth.js");
+  const { cookie, xsrf } = await getSessionAuth();
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "GET",
+    headers: { Cookie: cookie, "X-XSRF-TOKEN": xsrf, Accept: "application/json" },
+  });
+  if (res.status === 401) {
+    await silentRelogin();
+    const { cookie: freshCookie, xsrf: freshXsrf } = await getSessionAuth();
+    const retry = await fetch(`${BASE_URL}${path}`, {
+      method: "GET",
+      headers: { Cookie: freshCookie, "X-XSRF-TOKEN": freshXsrf, Accept: "application/json" },
+    });
+    return handle(retry);
+  }
+  return handle(res);
+}
+
 async function handle(res: Response): Promise<unknown> {
   const text = await res.text();
   if (!res.ok) {
